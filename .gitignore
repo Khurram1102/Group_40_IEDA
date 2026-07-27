@@ -1,1 +1,4 @@
 .DS_Store
+SoSe26_Case_Study_Group_40/data/*
+!SoSe26_Case_Study_Group_40/data/.gitkeep
+!SoSe26_Case_Study_Group_40/data/SoSe26_Case_Study_finalData_Group_40.csv
