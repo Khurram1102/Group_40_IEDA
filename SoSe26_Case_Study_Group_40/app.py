@@ -57,6 +57,7 @@ GEO_COLUMN_ALIASES = {
 }
 
 GEO_LEVEL_LABELS = {
+    "region": "Postal regions (coarse)",
     "municipality": "Municipalities",
     "postal_code": "Postal codes",
 }
@@ -76,6 +77,25 @@ TYPE_COLORS = {
     "OEM2_Typ22": "#7857C6",
 }
 
+# Map bubbles are coloured by how long the vehicles registered at a location
+# took to build: cool for fast, warm for slow.
+LEADTIME_COLORSCALE = [
+    [0.0, "#7FC3EE"],
+    [0.4, "#2B8FD8"],
+    [0.7, "#F59E55"],
+    [1.0, "#F07A6A"],
+]
+
+# The three defect measures plotted over time. "Total" follows the brief's
+# cascading rule and is therefore near-saturated; showing it beside the two
+# sources is what makes that visible instead of misleading.
+SOURCE_COLORS = {
+    "in_house": "#1877C9",
+    "component": "#F59E55",
+    "total": "#7857C6",
+    "intact": "#38B7A5",
+}
+
 CAUSE_COLORS = {
     "In-house only": "#1877C9",
     "Component only": "#F59E55",
@@ -88,6 +108,26 @@ CHART_CONFIG = {
     "responsive": True,
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
 }
+
+# Optional columns: present once the notebook has been re-run with the
+# bottleneck features. The dashboard degrades gracefully when they are absent.
+BOTTLENECK_COLUMNS = {
+    "Bottleneck_Komponente_Typ",
+    "Bottleneck_PartToComp_Days",
+    "Bottleneck_Einzelteil_Typ",
+    "Bottleneck_Tier2_Werk",
+}
+
+# Same cut-off the notebook uses for the extreme tail, so the dashboard and the
+# report always quote the same percentages.
+SLOW_THRESHOLD_DAYS = 100
+
+# Components used in the OEM2 vehicle family, highlighted in the charts.
+OEM2_COMPONENTS = {
+    "K6", "K7", "K3AG2", "K3SG2", "K2LE2", "K2ST2", "K1BE2", "K1DI2",
+}
+
+COMPONENT_COLORS = {"oem2": "#F07A6A", "oem1": "#1877C9"}
 
 
 # =============================================================================
@@ -155,6 +195,10 @@ def load_dataset(path: str) -> tuple[pd.DataFrame, list[str]]:
         "Breitengrad": "float32",
         "Zulassung_lat": "float32",
         "Zulassung_lon": "float32",
+        "Bottleneck_Komponente_Typ": "category",
+        "Bottleneck_Einzelteil_Typ": "category",
+        "Bottleneck_Tier2_Werk": "category",
+        "Bottleneck_PartToComp_Days": "float32",
     }
     dtype_map = {
         column: dtype
@@ -287,15 +331,25 @@ def prepare_geo_aggregates(
     if not latitude_column or not longitude_column:
         return {}
 
+    # "region" is the first digit of the postal code (the German Leitzone), a
+    # coarse grouping derived from the dataset's own PLZ column. It exists so
+    # the map has a readable overview level - roughly ten bubbles instead of
+    # several thousand.
+    level_columns = {
+        "region": geo_schema["postal_code"],
+        "municipality": geo_schema["municipality"],
+        "postal_code": geo_schema["postal_code"],
+    }
     aggregates: dict[str, pd.DataFrame] = {}
-    for level in ("municipality", "postal_code"):
-        location_column = geo_schema[level]
+    for level in ("region", "municipality", "postal_code"):
+        location_column = level_columns[level]
         if not location_column:
             continue
 
         required = [
             "ID_Fahrzeug",
             "Fahrzeug_Typ",
+            "LeadTime_Total_Days",
             location_column,
             latitude_column,
             longitude_column,
@@ -332,6 +386,13 @@ def prepare_geo_aggregates(
                 "PLZ "
                 + location.str.replace(r"\.0$", "", regex=True).str.zfill(5)
             )
+        elif level == "region":
+            digit = (
+                location.str.replace(r"\.0$", "", regex=True)
+                .str.zfill(5)
+                .str[0]
+            )
+            location = "PLZ " + digit + "0000-" + digit + "9999"
         geo_data["_Geo_Location"] = location
 
         aggregate = (
@@ -342,6 +403,11 @@ def prepare_geo_aggregates(
             )
             .agg(
                 vehicle_count=("ID_Fahrzeug", "size"),
+                # Sum and count instead of a median: unlike a median these
+                # combine exactly when several vehicle types are selected, so
+                # the mean stays correct under every filter.
+                leadtime_sum=("LeadTime_Total_Days", "sum"),
+                leadtime_count=("LeadTime_Total_Days", "count"),
                 longitude=(longitude_column, "mean"),
                 latitude=(latitude_column, "mean"),
             )
@@ -376,6 +442,7 @@ if DATA_LOAD_ERROR is None:
     GEO_SCHEMA = detect_geo_schema(DATA_FRAME.columns)
     GEO_AGGREGATES = prepare_geo_aggregates(DATA_FRAME, GEO_SCHEMA)
     GEO_AVAILABLE = bool(GEO_AGGREGATES)
+    BOTTLENECK_AVAILABLE = BOTTLENECK_COLUMNS.issubset(DATA_FRAME.columns)
 else:
     VEHICLE_TYPES = []
     YEAR_VALUES = []
@@ -383,6 +450,7 @@ else:
     GEO_SCHEMA = detect_geo_schema([])
     GEO_AVAILABLE = False
     GEO_AGGREGATES = {}
+    BOTTLENECK_AVAILABLE = False
 
 
 # =============================================================================
@@ -755,6 +823,24 @@ def quality_page() -> html.Div:
         [
             field("Vehicle type", vehicle_type_dropdown("quality-types")),
             field("Production year", year_slider("quality-years")),
+            field(
+                "Trend view",
+                dcc.RadioItems(
+                    id="quality-trend-view",
+                    options=[
+                        {"label": "By defect source", "value": "source"},
+                        {"label": "By vehicle type", "value": "type"},
+                    ],
+                    value="source",
+                    className="segmented-control",
+                    inputClassName="segmented-input",
+                    labelClassName="segmented-label",
+                ),
+                hint=(
+                    "The total rate is near-saturated by design; splitting it "
+                    "by source shows which part of it actually moves."
+                ),
+            ),
         ]
     )
     content = html.Section(
@@ -765,38 +851,50 @@ def quality_page() -> html.Div:
                         "Total vehicles", "quality-total", "Selected population"
                     ),
                     metric_card(
-                        "Overall defect rate",
+                        "Vehicles with any flag",
                         "quality-rate",
-                        "Defective = vehicle itself or any installed part/component "
-                        "is marked defective (case-study brief).",
+                        "At least one of the ~19 parts, components, or the "
+                        "vehicle record itself is flagged (case-study brief).",
+                    ),
+                    metric_card(
+                        "Completely unflagged",
+                        "quality-clean",
+                        "Nothing flagged anywhere in the vehicle",
                     ),
                     metric_card(
                         "In-house involvement",
                         "quality-own-share",
-                        "Share of defective vehicles",
-                    ),
-                    metric_card(
-                        "Component involvement",
-                        "quality-component-share",
-                        "Share of defective vehicles",
+                        "Share of flagged vehicles",
                     ),
                 ],
                 className="metric-grid",
             ),
-            html.P(
-                "Why is the defect rate so high? Following the brief's definition, "
-                "a vehicle counts as defective if the vehicle itself, any "
-                "installed component, or any single part is flagged defective. "
-                "Because each vehicle contains many components and thousands of "
-                "single parts, these part-level flags cascade upward, so a high "
-                "overall rate is expected and does not indicate a data error.",
-                className="placeholder-note",
+            html.Div(
+                [
+                    html.Strong("Read this figure as a cascade, not a verdict"),
+                    html.Span(
+                        "A vehicle carries roughly 19 items that can each be "
+                        "flagged: about 14 single parts, its 4 components, and "
+                        "the vehicle record itself. Each one is individually "
+                        "around 90% clean - but requiring all 19 to be clean at "
+                        "once is what leaves only a small share unflagged."
+                    ),
+                    html.Small(
+                        "So the headline figure mostly reflects how many parts a "
+                        "vehicle contains, not how well it was assembled. The "
+                        "in-house rate below is the one the plant controls."
+                    ),
+                ],
+                className="finding-callout",
             ),
             html.Div(id="quality-callout", className="finding-callout"),
             graph_card(
                 "quality-trend",
-                "Track whether defect rates improve over time and whether a specific "
-                "model drives the change.",
+                "In-house assembly is the rate the plant actually controls. The "
+                "total sits far above it and tracks the component line almost "
+                "exactly - the supply chain, not final assembly, sets it. The "
+                "defect-free line is the share leaving the plant with nothing "
+                "flagged anywhere, i.e. the complement of the total.",
             ),
             graph_card(
                 "quality-causes",
@@ -843,9 +941,10 @@ def lead_time_page() -> html.Div:
                         class_name="chart-card half-card",
                     ),
                     graph_card(
-                        "lead-defect-comparison",
-                        "Check whether long lead times are associated with defective "
-                        "vehicles.",
+                        "lead-median",
+                        "The headline number per model, read straight off the "
+                        "bar - the boxplot beside it shows the spread behind "
+                        "each median.",
                         class_name="chart-card half-card",
                     ),
                 ],
@@ -869,6 +968,101 @@ def lead_time_page() -> html.Div:
             two_column_page(sidebar, content),
         ]
     )
+
+
+def component_color(component_type: str) -> str:
+    """Colour OEM2-family components distinctly from OEM1-family ones."""
+
+    family = "oem2" if component_type in OEM2_COMPONENTS else "oem1"
+    return COMPONENT_COLORS[family]
+
+
+def bottleneck_page() -> html.Div:
+    """Create the component/part bottleneck page behind the headline finding."""
+
+    intro = page_intro(
+        "Component bottleneck",
+        "Trace long lead times down to the component, part, and supplier plant "
+        "responsible.",
+    )
+    if not BOTTLENECK_AVAILABLE:
+        missing = sorted(BOTTLENECK_COLUMNS - set(DATA_FRAME.columns))
+        return html.Div(
+            [
+                intro,
+                html.Div(
+                    [
+                        html.Div("Bottleneck data pending", className="status-pill"),
+                        html.H2("This page activates automatically"),
+                        html.P(
+                            "Re-run the case-study notebook to add the bottleneck "
+                            "features to the final dataset, then restart the app. "
+                            "Nothing else needs to change."
+                        ),
+                        html.H3("Columns still required"),
+                        html.Ul([html.Li(column) for column in missing]),
+                    ],
+                    className="not-available-panel",
+                ),
+            ]
+        )
+
+    sidebar = filter_card(
+        [
+            field("Vehicle type", vehicle_type_dropdown("bottleneck-types")),
+            field("Production year", year_slider("bottleneck-years")),
+        ]
+    )
+    content = html.Section(
+        [
+            html.Div(
+                [
+                    metric_card(
+                        "Vehicles in selection",
+                        "bottleneck-total",
+                        "Each vehicle counted once",
+                    ),
+                    metric_card(
+                        "Held up over 100 days",
+                        "bottleneck-slow",
+                        f"Bottleneck component took more than "
+                        f"{SLOW_THRESHOLD_DAYS} days",
+                    ),
+                    metric_card(
+                        "Most frequent bottleneck",
+                        "bottleneck-worst",
+                        "Component causing the longest delays",
+                    ),
+                ],
+                className="metric-grid",
+            ),
+            html.Div(id="bottleneck-callout", className="finding-callout"),
+            graph_card(
+                "bottleneck-components",
+                "Each vehicle is attributed to whichever of its four installed "
+                "components took longest. Red marks the OEM2 component family.",
+            ),
+            html.Div(
+                [
+                    graph_card(
+                        "bottleneck-parts",
+                        "Among vehicles delayed beyond 100 days: which individual "
+                        "part was the oldest one waiting in the component.",
+                        class_name="chart-card half-card",
+                    ),
+                    graph_card(
+                        "bottleneck-plants",
+                        "Among those same vehicles: which Tier-2 supplier plants "
+                        "the delaying parts came from.",
+                        class_name="chart-card half-card",
+                    ),
+                ],
+                className="chart-grid",
+            ),
+        ],
+        className="content-column",
+    )
+    return html.Div([intro, two_column_page(sidebar, content)])
 
 
 def full_dataset_page() -> html.Div:
@@ -1018,6 +1212,7 @@ NAV_ITEMS = [
     ("Monthly", "/monthly"),
     ("Quality", "/quality"),
     ("Lead time", "/lead-time"),
+    ("Bottleneck", "/bottleneck"),
     ("Full dataset", "/dataset"),
     ("Download", "/download"),
 ]
@@ -1135,6 +1330,7 @@ def render_page(pathname: str) -> html.Component:
         "/monthly": monthly_page,
         "/quality": quality_page,
         "/lead-time": lead_time_page,
+        "/bottleneck": bottleneck_page,
         "/dataset": full_dataset_page,
         "/download": download_page,
     }
@@ -1317,17 +1513,19 @@ def update_monthly_chart(
 @app.callback(
     Output("quality-total", "children"),
     Output("quality-rate", "children"),
+    Output("quality-clean", "children"),
     Output("quality-own-share", "children"),
-    Output("quality-component-share", "children"),
     Output("quality-callout", "children"),
     Output("quality-trend", "figure"),
     Output("quality-causes", "figure"),
     Input("quality-types", "value"),
     Input("quality-years", "value"),
+    Input("quality-trend-view", "value"),
 )
 def update_quality(
     vehicle_types: list[str] | None,
     years: list[int],
+    trend_view: str,
 ) -> tuple[str, str, str, str, html.Component, go.Figure, go.Figure]:
     """Update quality KPIs, comparison callout, trend, and cause breakdown."""
 
@@ -1340,7 +1538,7 @@ def update_quality(
         & production_year.between(start_year, end_year)
     ]
     if filtered.empty:
-        empty_trend = empty_figure("Defect rate over time by vehicle type")
+        empty_trend = empty_figure("Defect rate over time")
         empty_causes = empty_figure("Defect cause breakdown")
         return (
             "0",
@@ -1391,45 +1589,114 @@ def update_quality(
         ]
     )
 
-    trend = (
-        filtered.groupby(
-            ["_Production_Month", "Fahrzeug_Typ"],
-            observed=True,
-            sort=True,
-        )[["total_vehicles", "final_defects"]]
-        .sum()
-        .reset_index()
-    )
-    trend["defect_rate"] = trend["final_defects"].div(
-        trend["total_vehicles"].replace(0, np.nan)
-    )
     trend_figure = go.Figure()
-    for index, vehicle_type in enumerate(types):
-        group = trend.loc[trend["Fahrzeug_Typ"].astype(str).eq(vehicle_type)]
-        if group.empty:
-            continue
-        trend_figure.add_trace(
-            go.Scatter(
-                x=group["_Production_Month"],
-                y=group["defect_rate"],
-                name=vehicle_type,
-                mode="lines+markers",
-                line={"color": color_for_type(vehicle_type, index), "width": 2.5},
-                marker={"size": 6},
-                hovertemplate=(
-                    "%{x|%b %Y}<br>Defect rate: %{y:.2%}<extra>"
-                    + vehicle_type
-                    + "</extra>"
-                ),
-            )
+    if trend_view == "source":
+        # One row per month across the whole selection, so the three measures
+        # share a denominator and can be read against each other directly.
+        monthly = (
+            filtered.groupby("_Production_Month", observed=True, sort=True)[
+                [
+                    "total_vehicles",
+                    "final_defects",
+                    "in_house_defects",
+                    "component_defects",
+                ]
+            ]
+            .sum()
+            .reset_index()
         )
-    apply_figure_style(
-        trend_figure,
-        "Defect rate over time by vehicle type",
-        "Production month",
-        "Defect rate (%)",
-        "Vehicle type",
-    )
+        denominator = monthly["total_vehicles"].replace(0, np.nan)
+        source_series = [
+            (
+                "In-house assembly",
+                monthly["in_house_defects"].div(denominator),
+                SOURCE_COLORS["in_house"],
+                "solid",
+            ),
+            (
+                "Via installed components",
+                monthly["component_defects"].div(denominator),
+                SOURCE_COLORS["component"],
+                "solid",
+            ),
+            (
+                "Total (brief's definition)",
+                monthly["final_defects"].div(denominator),
+                SOURCE_COLORS["total"],
+                "dot",
+            ),
+            (
+                "Defect-free (intact)",
+                monthly["total_vehicles"]
+                .sub(monthly["final_defects"])
+                .div(denominator),
+                SOURCE_COLORS["intact"],
+                "dash",
+            ),
+        ]
+        for label, values, colour, dash in source_series:
+            trend_figure.add_trace(
+                go.Scatter(
+                    x=monthly["_Production_Month"],
+                    y=values,
+                    name=label,
+                    mode="lines",
+                    line={"color": colour, "width": 2.5, "dash": dash},
+                    hovertemplate=(
+                        "%{x|%b %Y}<br>" + label + ": %{y:.2%}<extra></extra>"
+                    ),
+                )
+            )
+        apply_figure_style(
+            trend_figure,
+            "Defect rate over time by source",
+            "Production month",
+            "Share of vehicles (%)",
+            "Defect source",
+        )
+        trend_figure.update_layout(hovermode="x unified")
+    else:
+        trend = (
+            filtered.groupby(
+                ["_Production_Month", "Fahrzeug_Typ"],
+                observed=True,
+                sort=True,
+            )[["total_vehicles", "final_defects"]]
+            .sum()
+            .reset_index()
+        )
+        trend["defect_rate"] = trend["final_defects"].div(
+            trend["total_vehicles"].replace(0, np.nan)
+        )
+        for index, vehicle_type in enumerate(types):
+            group = trend.loc[trend["Fahrzeug_Typ"].astype(str).eq(vehicle_type)]
+            if group.empty:
+                continue
+            trend_figure.add_trace(
+                go.Scatter(
+                    x=group["_Production_Month"],
+                    y=group["defect_rate"],
+                    name=vehicle_type,
+                    mode="lines+markers",
+                    line={
+                        "color": color_for_type(vehicle_type, index),
+                        "width": 2.5,
+                    },
+                    marker={"size": 6},
+                    hovertemplate=(
+                        "%{x|%b %Y}<br>Defect rate: %{y:.2%}<extra>"
+                        + vehicle_type
+                        + "</extra>"
+                    ),
+                )
+            )
+        apply_figure_style(
+            trend_figure,
+            "Total defect rate over time by vehicle type",
+            "Production month",
+            "Defect rate (%)",
+            "Vehicle type",
+        )
     trend_figure.update_yaxes(tickformat=".1%", rangemode="tozero")
     trend_figure.update_xaxes(tickformat="%b\n%Y")
 
@@ -1463,8 +1730,8 @@ def update_quality(
     return (
         f"{total:,}",
         f"{defect_rate:.2%}",
+        f"{1 - defect_rate:.2%}",
         f"{own_share:.1%}",
-        f"{component_share:.1%}",
         callout,
         trend_figure,
         cause_figure,
@@ -1550,22 +1817,10 @@ def lead_time_statistics(
         )
     )
 
-    defect_frame = (
-        filtered.groupby("Fahrzeug_Fehlerhaft_Final", observed=True)[
-            "LeadTime_Total_Days"
-        ]
-        .agg(["median", "count"])
-        .reset_index()
-    )
-    defect_results = tuple(
-        (int(flag), float(median), int(count))
-        for flag, median, count in defect_frame.itertuples(index=False, name=None)
-    )
     return (
         tuple(box_results),
         stage_results,
         trend_results,
-        defect_results,
     )
 
 
@@ -1573,7 +1828,7 @@ def lead_time_statistics(
     Output("lead-box", "figure"),
     Output("lead-stages", "figure"),
     Output("lead-trend", "figure"),
-    Output("lead-defect-comparison", "figure"),
+    Output("lead-median", "figure"),
     Input("lead-types", "value"),
     Input("lead-years", "value"),
 )
@@ -1589,7 +1844,6 @@ def update_lead_time(
         box_statistics,
         stage_statistics,
         trend_statistics,
-        defect_statistics,
     ) = lead_time_statistics(tuple(types), start_year, end_year)
 
     if box_statistics:
@@ -1638,7 +1892,7 @@ def update_lead_time(
             box_figure,
             empty_figure("Median duration per supply-chain stage"),
             empty_figure("Median total lead time over the years"),
-            empty_figure("Lead time: defect-free vs defective vehicles"),
+            empty_figure("Median total lead time by vehicle type"),
         )
 
     stage_specs = [
@@ -1710,47 +1964,281 @@ def update_lead_time(
     )
     trend_figure.update_xaxes(dtick=1)
 
-    defect_lookup = {
-        flag: (median, count) for flag, median, count in defect_statistics
-    }
-    defect_labels = ["Defect-free", "Defective"]
-    defect_medians = []
-    defect_counts = []
-    for flag in [0, 1]:
-        if flag in defect_lookup:
-            median, count = defect_lookup[flag]
-            defect_medians.append(median)
-            defect_counts.append(count)
-        else:
-            defect_medians.append(np.nan)
-            defect_counts.append(0)
-    defect_figure = go.Figure(
+    # Medians already come out of the cached box statistics, so the headline
+    # figure per model costs no extra pass over the data.
+    median_labels = [stats[0] for stats in box_statistics]
+    median_values = [stats[2] for stats in box_statistics]
+    median_counts = [stats[6] for stats in box_statistics]
+    median_figure = go.Figure(
         go.Bar(
-            x=defect_labels,
-            y=defect_medians,
-            customdata=np.array(defect_counts)[:, None],
-            marker_color=["#55A7E8", "#F07A6A"],
-            text=[
-                f"{value:.1f} d" if not np.isnan(value) else "No data"
-                for value in defect_medians
+            x=median_labels,
+            y=median_values,
+            customdata=np.array(median_counts)[:, None],
+            marker_color=[
+                color_for_type(label, index)
+                for index, label in enumerate(median_labels)
             ],
+            text=[f"{value:.0f} d" for value in median_values],
             textposition="outside",
             cliponaxis=False,
             hovertemplate=(
-                "%{x}<br>Median: %{y:.2f} days<br>Vehicles: "
+                "%{x}<br>Median: %{y:.1f} days<br>Vehicles: "
                 "%{customdata[0]:,.0f}<extra></extra>"
             ),
         )
     )
     apply_figure_style(
-        defect_figure,
-        "Lead time: defect-free vs defective vehicles",
-        "Final quality status",
+        median_figure,
+        "Median total lead time by vehicle type",
+        "Vehicle type",
         "Median total lead time (days)",
     )
-    defect_figure.update_layout(showlegend=False)
+    median_figure.update_layout(showlegend=False)
 
-    return box_figure, stage_figure, trend_figure, defect_figure
+    return box_figure, stage_figure, trend_figure, median_figure
+
+
+@lru_cache(maxsize=12)
+def bottleneck_statistics(
+    vehicle_types: tuple[str, ...], start_year: int, end_year: int
+) -> tuple:
+    """Cache component, part, and plant summaries for a filter selection."""
+
+    filtered = DATA_FRAME.loc[
+        DATA_FRAME["Fahrzeug_Typ"].astype(str).isin(vehicle_types)
+        & DATA_FRAME["_Production_Year"].between(start_year, end_year),
+        [
+            "Bottleneck_Komponente_Typ",
+            "Bottleneck_PartToComp_Days",
+            "Bottleneck_Einzelteil_Typ",
+            "Bottleneck_Tier2_Werk",
+        ],
+    ]
+    if filtered.empty:
+        return (), (), (), (0, 0)
+
+    is_slow = filtered["Bottleneck_PartToComp_Days"] > SLOW_THRESHOLD_DAYS
+    summary = (
+        filtered.assign(_slow=is_slow)
+        .groupby("Bottleneck_Komponente_Typ", observed=True)
+        .agg(
+            median_days=("Bottleneck_PartToComp_Days", "median"),
+            vehicles=("Bottleneck_PartToComp_Days", "size"),
+            slow_share=("_slow", "mean"),
+        )
+        .reset_index()
+    )
+    component_results = tuple(
+        (str(name), float(median), int(count), float(share) * 100)
+        for name, median, count, share in summary.itertuples(
+            index=False, name=None
+        )
+    )
+
+    slow_rows = filtered.loc[is_slow]
+    part_results = tuple(
+        (str(name), int(count))
+        for name, count in slow_rows["Bottleneck_Einzelteil_Typ"]
+        .value_counts()
+        .head(8)
+        .items()
+    )
+    plant_results = tuple(
+        (str(name), int(count))
+        for name, count in slow_rows["Bottleneck_Tier2_Werk"]
+        .value_counts()
+        .head(8)
+        .items()
+    )
+    return (
+        component_results,
+        part_results,
+        plant_results,
+        (int(len(filtered)), int(is_slow.sum())),
+    )
+
+
+def ranked_bar(
+    rows: tuple[tuple[str, int], ...],
+    title: str,
+    x_title: str,
+    colour: str,
+    total_slow: int,
+) -> go.Figure:
+    """Render a ranked count bar chart shared by the part and plant views."""
+
+    if not rows:
+        return empty_figure(title, "No vehicles beyond the delay threshold.")
+    labels = [name for name, _ in rows]
+    counts = [count for _, count in rows]
+    shares = [count / total_slow if total_slow else 0 for count in counts]
+    figure = go.Figure(
+        go.Bar(
+            x=counts,
+            y=labels,
+            orientation="h",
+            marker_color=colour,
+            customdata=np.array(shares)[:, None],
+            text=[f"{share:.1%}" for share in shares],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=(
+                "%{y}<br>Vehicles: %{x:,.0f}<br>"
+                "Share of delayed: %{customdata[0]:.1%}<extra></extra>"
+            ),
+        )
+    )
+    apply_figure_style(figure, title, x_title, None)
+    figure.update_layout(showlegend=False)
+    figure.update_yaxes(autorange="reversed")
+    return figure
+
+
+@app.callback(
+    Output("bottleneck-total", "children"),
+    Output("bottleneck-slow", "children"),
+    Output("bottleneck-worst", "children"),
+    Output("bottleneck-callout", "children"),
+    Output("bottleneck-components", "figure"),
+    Output("bottleneck-parts", "figure"),
+    Output("bottleneck-plants", "figure"),
+    Input("bottleneck-types", "value"),
+    Input("bottleneck-years", "value"),
+)
+def update_bottleneck(
+    vehicle_types: list[str] | None,
+    years: list[int],
+) -> tuple:
+    """Update the bottleneck KPIs, finding, and the three diagnostic charts."""
+
+    types = selected_types(vehicle_types)
+    start_year, end_year = years
+    components, parts, plants, totals = bottleneck_statistics(
+        tuple(types), start_year, end_year
+    )
+    total_vehicles, slow_vehicles = totals
+
+    if not components:
+        blank = empty_figure("Bottleneck component by vehicle")
+        return (
+            "0",
+            "0",
+            "—",
+            "No data for this selection.",
+            blank,
+            empty_figure("Delaying part"),
+            empty_figure("Tier-2 supplier plant"),
+        )
+
+    # The component with the largest share of >100-day vehicles is the one
+    # driving the extreme tail; ties fall back to the higher median.
+    worst = max(components, key=lambda row: (row[3], row[1]))
+    worst_name, worst_median, _worst_count, worst_share = worst
+
+    by_share = sorted(components, key=lambda row: row[3], reverse=True)
+    share_figure = go.Figure(
+        go.Bar(
+            x=[row[0] for row in by_share],
+            y=[row[3] for row in by_share],
+            marker_color=[component_color(row[0]) for row in by_share],
+            customdata=np.array(
+                [[row[1], row[2]] for row in by_share], dtype=float
+            ),
+            text=[f"{row[3]:.1f}%" for row in by_share],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=(
+                "%{x}<br>Over " + str(SLOW_THRESHOLD_DAYS) + " days: %{y:.2f}%"
+                "<br>Median: %{customdata[0]:.1f} days"
+                "<br>Vehicles: %{customdata[1]:,.0f}<extra></extra>"
+            ),
+        )
+    )
+    apply_figure_style(
+        share_figure,
+        f"Share of vehicles held up more than {SLOW_THRESHOLD_DAYS} days, "
+        "by bottleneck component",
+        "Bottleneck component",
+        "Share of vehicles (%)",
+    )
+    share_figure.update_layout(showlegend=False)
+
+    parts_figure = ranked_bar(
+        parts,
+        "Delaying part (vehicles beyond the threshold)",
+        "Vehicles",
+        "#7857C6",
+        slow_vehicles,
+    )
+    plants_figure = ranked_bar(
+        plants,
+        "Tier-2 supplier plant (vehicles beyond the threshold)",
+        "Vehicles",
+        "#38B7A5",
+        slow_vehicles,
+    )
+
+    top_part = parts[0][0] if parts else "n/a"
+    top_plant = plants[0][0] if plants else "n/a"
+    callout = html.Div(
+        [
+            html.Strong("Main finding · where the delay comes from"),
+            html.Span(
+                f"{worst_name} is the bottleneck component with the largest "
+                f"extreme tail: {worst_share:.1f}% of the vehicles it holds up "
+                f"wait longer than {SLOW_THRESHOLD_DAYS} days "
+                f"(median {worst_median:.0f} days). Among those delayed "
+                f"vehicles the oldest waiting part is most often {top_part}, "
+                f"supplied from {top_plant}."
+            ),
+            html.Small(
+                "Recommended focus: OEM2_Typ21 — it shares the highest median "
+                "lead time with Typ22 but affects far more vehicles, and both "
+                "root causes apply to it."
+            ),
+        ]
+    )
+
+    slow_pct = slow_vehicles / total_vehicles if total_vehicles else 0
+    return (
+        f"{total_vehicles:,}",
+        f"{slow_vehicles:,} ({slow_pct:.1%})",
+        worst_name,
+        callout,
+        share_figure,
+        parts_figure,
+        plants_figure,
+    )
+
+
+def geo_hover_text(
+    location: str,
+    pivot: pd.DataFrame,
+    types: list[str],
+    note: str | None = None,
+) -> tuple[str, int]:
+    """Build one bubble's tooltip and its total, derived from the type lines.
+
+    The total is summed from the very lines shown underneath it, so the two can
+    never disagree. `note` carries the mean lead time, so the value the bubble's
+    colour encodes is also readable as a number.
+    """
+
+    lines = []
+    total = 0
+    for vehicle_type in types:
+        count = (
+            int(pivot.loc[location, vehicle_type])
+            if location in pivot.index and vehicle_type in pivot.columns
+            else 0
+        )
+        total += count
+        lines.append(f"{vehicle_type}: {count:,}")
+    header = [f"<b>{location}</b>", f"Total vehicles: {total:,}"]
+    if note:
+        header.append(note)
+    text = "<br>".join([*header, *lines])
+    return text, total
 
 
 @app.callback(
@@ -1758,7 +2246,10 @@ def update_lead_time(
     Input("geo-level", "value"),
     Input("geo-types", "value"),
 )
-def update_geo_map(level: str, vehicle_types: list[str] | None) -> go.Figure:
+def update_geo_map(
+    level: str,
+    vehicle_types: list[str] | None,
+) -> go.Figure:
     """Build the map only from detected, real geodata columns."""
 
     types = selected_types(vehicle_types)
@@ -1773,11 +2264,30 @@ def update_geo_map(level: str, vehicle_types: list[str] | None) -> go.Figure:
         filtered.groupby("location", observed=True, sort=True)
         .agg(
             vehicle_count=("vehicle_count", "sum"),
+            leadtime_sum=("leadtime_sum", "sum"),
+            leadtime_count=("leadtime_count", "sum"),
             longitude=("longitude", "mean"),
             latitude=("latitude", "mean"),
         )
         .reset_index()
     )
+    grouped["mean_leadtime"] = grouped["leadtime_sum"].div(
+        grouped["leadtime_count"].replace(0, np.nan)
+    )
+
+    # Colour range clipped to the 5th–95th percentile so the bulk of the
+    # locations spread across the full scale instead of collapsing into one
+    # shade; a couple of extreme sites no longer flatten everyone else.
+    # Falls back to real min/max when there aren't enough distinct values.
+    leadtimes = grouped["mean_leadtime"].dropna()
+    if len(leadtimes) >= 2:
+        cmin = float(leadtimes.quantile(0.01))
+        cmax = float(leadtimes.quantile(0.99))
+        if cmin == cmax:  # all values (near) identical → let Plotly auto-range
+            cmin = cmax = None
+    else:
+        cmin = cmax = None
+
     pivot = filtered.pivot_table(
         index="location",
         columns="Fahrzeug_Typ",
@@ -1786,66 +2296,95 @@ def update_geo_map(level: str, vehicle_types: list[str] | None) -> go.Figure:
         fill_value=0,
         observed=True,
     )
-    hover_text = []
-    for location in grouped["location"].astype(str):
-        # Build the per-type lines first and derive the total from them, so the
-        # displayed "Total vehicles" is always exactly the sum of the type lines
-        # shown below it (prevents any total-vs-parts rounding mismatch).
-        type_lines = []
-        total = 0
-        for vehicle_type in types:
-            count = (
-                int(pivot.loc[location, vehicle_type])
-                if location in pivot.index and vehicle_type in pivot.columns
-                else 0
-            )
-            total += count
-            type_lines.append(f"{vehicle_type}: {count:,}")
-        details = [f"<b>{location}</b>", f"Total vehicles: {total:,}", *type_lines]
-        hover_text.append("<br>".join(details))
 
+    # Every location is drawn - nothing is hidden behind a cutoff. Dense areas
+    # are resolved by zooming in, which is what the map is for.
+    grouped = grouped.reset_index(drop=True)
+    total_locations = len(grouped)
+
+    # Bubbles are scaled by area against the largest one on screen; the smaller
+    # ceiling and the outline keep neighbouring towns distinguishable.
     max_count = max(float(grouped["vehicle_count"].max()), 1.0)
+    # Map markers cannot carry an outline, so separation comes from the smaller
+    # size ceiling plus partial transparency; allowoverlap keeps every bubble
+    # drawn instead of silently dropping the ones underneath.
+    marker_base = {
+        "sizemode": "area",
+        "sizeref": 2.0 * max_count / (34.0**2),
+        "sizemin": 4,
+        "opacity": 0.72,
+        "allowoverlap": True,
+    }
+
+    hover = [
+        geo_hover_text(
+            str(name),
+            pivot,
+            types,
+            note=(
+                f"Mean lead time: {mean_days:,.1f} days"
+                if mean_days == mean_days
+                else "Mean lead time: n/a"
+            ),
+        )[0]
+        for name, mean_days in zip(
+            grouped["location"], grouped["mean_leadtime"], strict=True
+        )
+    ]
     figure = go.Figure(
         go.Scattermap(
             lat=grouped["latitude"],
             lon=grouped["longitude"],
             mode="markers",
             marker={
+                **marker_base,
                 "size": grouped["vehicle_count"],
-                "sizemode": "area",
-                "sizeref": 2.0 * max_count / (44.0**2),
-                "sizemin": 7,
-                "color": "#2B8FD8",
-                "opacity": 0.72,
+                "color": grouped["mean_leadtime"],
+                "cmin": cmin,
+                "cmax": cmax,
+                "colorscale": LEADTIME_COLORSCALE,
+                "colorbar": {
+                    "title": {"text": "Mean lead<br>time (days)"},
+                    "thickness": 14,
+                    "len": 0.7,
+                    "outlinewidth": 0,
+                },
+                "showscale": True,
             },
-            text=hover_text,
+            text=hover,
             hovertemplate="%{text}<extra></extra>",
             name="Registrations",
         )
     )
+
     level_label = {
+        "region": "postal region",
         "municipality": "municipality",
         "postal_code": "postal code",
     }.get(level, "location")
+    subtitle = f"all {total_locations:,}"
     figure.update_layout(
         title={
-            "text": f"Vehicle registrations by {level_label}",
+            "text": (
+                f"Vehicle registrations by {level_label} "
+                f"<span style='font-size:13px;color:#557086'>"
+                f"({subtitle})</span>"
+            ),
             "x": 0.02,
             "xanchor": "left",
         },
         map={
             "style": "open-street-map",
             "center": {"lat": 51.15, "lon": 10.45},
-            "zoom": 5.4,
+            "zoom": 4.9 if level == "region" else 5.4,
         },
         margin={"l": 0, "r": 0, "t": 64, "b": 0},
         font={"family": "Source Sans Pro, Arial, sans-serif", "color": "#17324D"},
         paper_bgcolor="rgba(0,0,0,0)",
         autosize=True,
-        legend={"title": {"text": "Measure"}},
+        showlegend=False,
     )
     return figure
-
 
 @lru_cache(maxsize=4)
 def table_positions(
